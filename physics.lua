@@ -200,6 +200,7 @@ function VoxelChunk.new(position, size)
 end
 
 function VoxelChunk:getDensityIndex(x, y, z)
+	-- flattening 3d coords into 1d makes array access way faster than nested tables
 	local res = self.size / VOXEL_RESOLUTION
 	return x + y * res + z * res * res
 end
@@ -241,6 +242,7 @@ end
 function VoxelChunk:setDensity(x, y, z, value)
 	local idx = self:getDensityIndex(x, y, z)
 	self.densityField[idx] = value
+	-- marking dirty ensures mesh rebuilds on next update cycle
 	self.isDirty = true
 end
 
@@ -249,6 +251,7 @@ function VoxelChunk:modifyDensity(worldPos, radius, strength, addMode)
 	local localPos = (worldPos - self.position) / VOXEL_RESOLUTION
 
 	local radiusInVoxels = radius / VOXEL_RESOLUTION
+	-- clamping bounds prevents us from iterating outside the chunk's voxel grid
 	local minX = math.max(0, math.floor(localPos.X - radiusInVoxels))
 	local maxX = math.min(res, math.ceil(localPos.X + radiusInVoxels))
 	local minY = math.max(0, math.floor(localPos.Y - radiusInVoxels))
@@ -282,7 +285,8 @@ function VoxelChunk:modifyDensity(worldPos, radius, strength, addMode)
 	end
 
 	self.isDirty = true
-	self.creationTime = tick() -- any interaction resets the lifetime so actively used terrain stays visible
+	-- resetting timer on modification keeps actively sculpted terrain from disappearing mid-work
+	self.creationTime = tick()
 end
 
 -- tells marching cubes which cube corners are inside/outside the surface
@@ -345,10 +349,12 @@ function TerrainManager.new()
 end
 
 function TerrainManager:getChunkKey(x, y, z)
+	-- string keys let us use chunks table as a hashmap for O(1) lookups
 	return string.format("%d,%d,%d", x, y, z)
 end
 
 function TerrainManager:worldToChunkCoords(worldPos)
+	-- flooring division snaps any world position to its containing chunk
 	return Vector3.new(
 		math.floor(worldPos.X / CHUNK_SIZE),
 		math.floor(worldPos.Y / CHUNK_SIZE),
@@ -362,6 +368,7 @@ function TerrainManager:getOrCreateChunk(chunkCoords)
 	if not self.chunks[key] then
 		local worldPos = chunkCoords * CHUNK_SIZE
 		self.chunks[key] = VoxelChunk.new(worldPos, CHUNK_SIZE)
+		-- queueing new chunks ensures they get rendered on the next update pass
 		table.insert(self.meshUpdateQueue, self.chunks[key])
 	end
 
@@ -373,7 +380,7 @@ function VoxelChunk:updateLifetime()
 
 	local age = tick() - self.creationTime
 
-	-- keeping terrain around for 5 seconds gives enough time to work with it
+	-- 5 second delay gives enough time to work with terrain before it starts fading
 	if age > 5 then
 		local fadeProgress = math.min((age - 5) / 2, 1)
 
@@ -388,7 +395,7 @@ function VoxelChunk:updateLifetime()
 		local shrinkFactor = 1 - (fadeProgress * 0.3)
 		self.mesh.Size = Vector3.new(self.size, self.size, self.size) * shrinkFactor
 
-		-- fully transparent and shrunk means we can safely remove it
+		-- returning true signals manager to remove this chunk from memory
 		if fadeProgress >= 1 then
 			self.mesh:Destroy()
 			self.mesh = nil
@@ -410,7 +417,7 @@ function TerrainManager:deformTerrain(worldPos, radius, strength, addMode)
 				local chunk = self:getOrCreateChunk(Vector3.new(x, y, z))
 				chunk:modifyDensity(worldPos, radius, strength, addMode)
 
-				-- queue prevents rebuilding the same chunk multiple times per frame
+				-- checking prevents same chunk from getting queued multiple times in one frame
 				if not table.find(self.meshUpdateQueue, chunk) then
 					table.insert(self.meshUpdateQueue, chunk)
 				end
@@ -420,7 +427,7 @@ function TerrainManager:deformTerrain(worldPos, radius, strength, addMode)
 end
 
 function TerrainManager:update()
-	-- spreading mesh generation across frames prevents frame drops
+	-- spreading mesh generation across frames prevents frame drops from too much work at once
 	local processed = 0
 
 	while #self.meshUpdateQueue > 0 and processed < MAX_MARCHING_CUBES_PER_FRAME do
@@ -429,14 +436,14 @@ function TerrainManager:update()
 		processed = processed + 1
 	end
 
-	-- defer keeps processing going without blocking the main thread
+	-- deferring to next frame keeps processing going without blocking current frame
 	if #self.meshUpdateQueue > 0 then
 		task.defer(function()
 			self:update()
 		end)
 	end
 
-	-- removing old chunks prevents memory from filling up over time
+	-- cleaning up expired chunks prevents memory from growing unbounded
 	for key, chunk in pairs(self.chunks) do
 		local shouldRemove = chunk:updateLifetime()
 		if shouldRemove then
@@ -455,10 +462,10 @@ function TerrainManager:cleanup()
 	self.meshUpdateQueue = {}
 end
 
--- create the manager before generating initial terrain
+-- manager needs to exist before we can generate terrain into it
 local manager = TerrainManager.new()
 
--- pre-generating chunks around spawn means players see terrain immediately
+-- spawning terrain around origin means players dont fall through floor on load
 for x = -1, 1 do
 	for y = -1, 0 do
 		for z = -1, 1 do
@@ -467,11 +474,12 @@ for x = -1, 1 do
 	end
 end
 
--- binding to mouse lets us directly interact with the terrain
+-- mouse input drives terrain manipulation so we need references to both
 local player = Players.LocalPlayer
 local mouse = player:GetMouse()
 local isDeforming = false
-local deformMode = true -- keeping mode in a bool simplifies the button logic
+-- separating add/subtract into a mode lets us use same deformation code for both actions
+local deformMode = true
 
 mouse.Button1Down:Connect(function()
 	isDeforming = true
@@ -491,12 +499,12 @@ mouse.Button2Up:Connect(function()
 	isDeforming = false
 end)
 
--- heartbeat runs every frame so terrain updates feel responsive
+-- heartbeat runs every frame which gives us smooth continuous deformation
 RunService.Heartbeat:Connect(function(dt)
 	manager:update()
 
 	if isDeforming then
-		-- casting from above catches terrain even if mouse is pointing at sky
+		-- casting from above catches terrain even when cursor points at empty sky
 		local raycastResult = Workspace:Raycast(
 			mouse.Hit.Position + Vector3.new(0, 100, 0),
 			Vector3.new(0, -200, 0)
